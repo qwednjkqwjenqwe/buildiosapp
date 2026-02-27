@@ -1,0 +1,932 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:file_selector/file_selector.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:mime/mime.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:provider/provider.dart';
+import 'package:record/record.dart';
+import 'package:share_handler/share_handler.dart';
+
+import '../client.dart';
+import '../client_controller.dart';
+import '../commands.dart';
+import '../database.dart';
+import '../irc.dart';
+import '../logging.dart';
+import '../models.dart';
+import '../prefs.dart';
+
+final whitespaceRegExp = RegExp(r'\s', unicode: true);
+
+class Composer extends StatefulWidget {
+	final SharedMedia? sharedMedia;
+	final Draft? draft;
+
+	const Composer({ super.key, this.sharedMedia, this.draft });
+
+	@override
+	ComposerState createState() => ComposerState();
+}
+
+class ComposerState extends State<Composer> {
+	final _formKey = GlobalKey<FormState>();
+	final _focusNode = FocusNode();
+	final _controller = _CommandTextEditingController();
+	final _imagePicker = ImagePicker();
+
+	bool _isCommand = false;
+	bool _locationServiceAvailable = false;
+	bool _addMenuLoading = false;
+
+	DateTime? _ownTyping;
+	MessageModel? _replyTo;
+	AudioRecorder? _recorder;
+	Stream<String>? _recordTimer;
+
+	@override
+	void initState() {
+		super.initState();
+		_checkLocationService();
+
+		if (widget.sharedMedia != null) {
+			_initSharedMedia(widget.sharedMedia!);
+		}
+
+		if (widget.draft != null) {
+			_initDraft(widget.draft!);
+		}
+	}
+
+	void _checkLocationService() async {
+		bool avail = false;
+		try {
+			avail = await Geolocator.isLocationServiceEnabled();
+		} on Exception catch (err) {
+			log.print('Failed to check for location service: $err');
+		}
+
+		if (avail) {
+			var permission = await Geolocator.checkPermission();
+			avail = permission != LocationPermission.deniedForever;
+		}
+
+		if (!mounted) {
+			return;
+		}
+		setState(() {
+			_locationServiceAvailable = avail;
+		});
+	}
+
+	void _initSharedMedia(SharedMedia sharedMedia) {
+		var text = sharedMedia.content;
+		if (text != null) {
+			if (text.startsWith('/')) {
+				// Insert a zero-width space to ensure this doesn't end up
+				// being executed as a command
+				text = '\u200B$text';
+			}
+			_controller.text = text;
+			_isCommand = false;
+		}
+
+		var attachments = sharedMedia.attachments ?? [];
+		if (!attachments.isEmpty) {
+			var file = XFile(attachments.single!.path);
+			_runAddMenuTask(() async {
+				await _uploadFile(file);
+			});
+		}
+	}
+
+	void _initDraft(Draft draft) async {
+		_controller.text = draft.text;
+		_isCommand = draft.text.startsWith('/') && !draft.text.contains('\n');
+
+		if (draft.replyTo != null) {
+			var db = context.read<DB>();
+			var msg = await db.fetchMessage(draft.replyTo!);
+			if (msg != null) {
+				_replyTo = MessageModel(entry: msg);
+			}
+		}
+	}
+
+	String? _getReplyPrefix() {
+		if (_replyTo == null) {
+			return null;
+		}
+
+		var nickname = _replyTo!.msg.source!.name;
+		var prefix = '$nickname: ';
+		if (prefix.startsWith('/')) {
+			// Insert a zero-width space to ensure this doesn't end up
+			// being executed as a command
+			prefix = '\u200B$prefix';
+		}
+		return prefix;
+	}
+
+	int _getMaxPrivmsgLen() {
+		var buffer = context.read<BufferModel>();
+		var client = context.read<Client>();
+
+		var msg = IrcMessage(
+			'PRIVMSG',
+			[buffer.name, ''],
+			source: IrcSource(
+				client.nick,
+				user: '_' * client.isupport.usernameLen,
+				host: '_' * client.isupport.hostnameLen,
+			),
+		);
+		var raw = msg.toString() + '\r\n';
+		return client.isupport.lineLen - raw.length;
+	}
+
+	List<IrcMessage> _buildPrivmsg(String text) {
+		var buffer = context.read<BufferModel>();
+		var maxLen = _getMaxPrivmsgLen();
+
+		List<IrcMessage> messages = [];
+		for (var line in text.split('\n')) {
+			Map<String, String?> tags = {};
+			if (messages.isEmpty && _replyTo?.entry.networkMsgid != null) {
+				tags['+draft/reply'] = _replyTo!.entry.networkMsgid!;
+			}
+
+			while (maxLen > 1 && line.length > maxLen) {
+				// Pick a good cut-off index, preferably at a whitespace
+				// character
+				var i = line.substring(0, maxLen).lastIndexOf(whitespaceRegExp);
+				if (i <= 0) {
+					i = maxLen - 1;
+				}
+
+				var leading = line.substring(0, i + 1);
+				line = line.substring(i + 1);
+
+				messages.add(IrcMessage('PRIVMSG', [buffer.name, leading], tags: tags));
+			}
+
+			// We'll get ERR_NOTEXTTOSEND if we try to send an empty message
+			if (line != '') {
+				messages.add(IrcMessage('PRIVMSG', [buffer.name, line], tags: tags));
+			}
+		}
+
+		return messages;
+	}
+
+	void _send(List<IrcMessage> messages) async {
+		var buffer = context.read<BufferModel>();
+		var client = context.read<Client>();
+		var db = context.read<DB>();
+		var bufferList = context.read<BufferListModel>();
+		var network = context.read<NetworkModel>();
+
+		List<Future<IrcMessage>> futures = [];
+		for (var msg in messages) {
+			futures.add(client.sendTextMessage(msg));
+		}
+
+		if (!client.caps.enabled.contains('echo-message')) {
+			messages = await Future.wait(futures);
+
+			List<MessageEntry> entries = [];
+			for (var msg in messages) {
+				var entry = MessageEntry(msg, buffer.id);
+				entries.add(entry);
+			}
+			await db.storeMessages(entries);
+
+			var models = await buildMessageModelList(db, entries);
+			if (buffer.messageHistoryLoaded) {
+				buffer.addMessages(models, append: true);
+			}
+			bufferList.bumpLastDeliveredTime(buffer, entries.last.time);
+			if (network.networkEntry.bumpLastDeliveredTime(entries.last.time)) {
+				await db.storeNetwork(network.networkEntry);
+			}
+		}
+	}
+
+	void _submitCommand(String text) {
+		String name;
+		String? param;
+		var i = text.indexOf(' ');
+		if (i >= 0) {
+			name = text.substring(0, i);
+			param = text.substring(i + 1);
+		} else {
+			name = text;
+		}
+
+		var cmd = commands[name];
+		if (cmd == null) {
+			ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+				content: Text('Command not found'),
+			));
+			return;
+		}
+
+		String? msgText;
+		try {
+			msgText = cmd.exec(context, param);
+		} on CommandException catch (err) {
+			ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+				content: Text(err.message),
+			));
+			return;
+		}
+		if (msgText != null) {
+			var buffer = context.read<BufferModel>();
+			var msg = IrcMessage('PRIVMSG', [buffer.name, msgText]);
+			_send([msg]);
+		}
+	}
+
+	Future<bool> _showConfirmSendDialog(String text, int msgCount) async {
+		var result = await showDialog<bool>(
+			context: context,
+			builder: (context) => AlertDialog(
+				title: Text('Multiple messages'),
+				content: Text('You are about to send $msgCount messages because you composed a long text. Are you sure?'),
+				actions: [
+					TextButton(
+						child: Text('CANCEL'),
+						onPressed: () {
+							Navigator.pop(context, false);
+						},
+					),
+					ElevatedButton(
+						child: Text('SEND'),
+						onPressed: () {
+							Navigator.pop(context, true);
+						},
+					),
+				],
+			),
+		);
+		return result!;
+	}
+
+	Future<bool> _submitText(String text) async {
+		var messages = _buildPrivmsg(text);
+		if (messages.length == 0) {
+			return true;
+		} else if (messages.length > 3) {
+			var confirmed = await _showConfirmSendDialog(text, messages.length);
+			if (!confirmed || !mounted) {
+				return false;
+			}
+		}
+
+		_send(messages);
+		return true;
+	}
+
+	void _submit() async {
+		var buffer = context.read<BufferModel>();
+		var network = context.read<NetworkModel>();
+		if (!canSendMessageToBuffer(buffer, network)) {
+			ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+				content: Text('Network is offline'),
+			));
+			return;
+		}
+
+		// Remove empty lines at start and end of the text (can happen when
+		// pasting text)
+		var lines = _controller.text.split('\n');
+		while (!lines.isEmpty && lines.first.trim() == '') {
+			lines = lines.sublist(1);
+		}
+		while (!lines.isEmpty && lines.last.trim() == '') {
+			lines = lines.sublist(0, lines.length - 1);
+		}
+		var text = lines.join('\n');
+
+		var ok = true;
+		if (_isCommand) {
+			assert(text.startsWith('/'));
+			assert(!text.contains('\n'));
+
+			if (text.startsWith('//')) {
+				ok = await _submitText(text.substring(1));
+			} else {
+				_submitCommand(text.substring(1));
+			}
+		} else {
+			ok = await _submitText(text);
+		}
+		if (!ok) {
+			return;
+		}
+
+		_setOwnTyping(false);
+		_replyTo = null;
+		_controller.text = '';
+		_focusNode.requestFocus();
+		setState(() {
+			_isCommand = false;
+		});
+	}
+
+	Future<Iterable<_AutocompleteOption>> _buildOptions(TextEditingValue textEditingValue) async {
+		var text = textEditingValue.text;
+		var network = context.read<NetworkModel>();
+		var buffer = context.read<BufferModel>();
+		var client = context.read<Client>();
+		var bufferList = context.read<BufferListModel>();
+
+		if (text.startsWith('/') && !text.contains(' ')) {
+			text = text.toLowerCase().substring(1);
+			return commands.entries.where((entry) {
+				return entry.key.startsWith(text) && entry.value.isAvailable(context);
+			}).map((entry) => _AutocompleteOption('/' + entry.key, entry.value.description));
+		}
+
+		String pattern;
+		var i = text.lastIndexOf(' ');
+		if (i >= 0) {
+			pattern = text.substring(i + 1);
+		} else {
+			pattern = text;
+		}
+		pattern = pattern.toLowerCase();
+
+		if (pattern.length < 3) {
+			return [];
+		}
+
+		Iterable<_AutocompleteOption> result;
+		if (client.isChannel(pattern)) {
+			result = bufferList.buffers
+				.where((buffer) => buffer.network == network)
+				.map((buffer) => _AutocompleteOption(buffer.name, buffer.topic));
+		} else {
+			var members = buffer.members?.members.keys ?? [];
+			result = members.map((nickname) {
+				var realname = network.users.map[nickname]?.realname;
+				if (realname != null && isStubRealname(realname, nickname)) {
+					realname = null;
+				}
+				return _AutocompleteOption(nickname, realname);
+			});
+		}
+
+		return result.where((option) {
+			return option.value.toLowerCase().startsWith(pattern);
+		}).take(10).map((option) {
+			if (option.value.startsWith('/')) {
+				// Insert a zero-width space to ensure this doesn't end up
+				// being executed as a command
+				return _AutocompleteOption('\u200B' + option.value, option.description);
+			}
+			return option;
+		});
+	}
+
+	String _displayStringForOption(_AutocompleteOption option) {
+		var text = _controller.text;
+
+		var i = text.lastIndexOf(' ');
+		if (i >= 0) {
+			return text.substring(0, i + 1) + option.value + ' ';
+		} else if (option.value.startsWith('/')) { // command
+			return option.value + ' ';
+		} else {
+			return option.value + ': ';
+		}
+	}
+
+	void _sendTypingStatus() {
+		var buffer = context.read<BufferModel>();
+		var client = context.read<Client>();
+		if (!client.caps.enabled.contains('message-tags') || !client.isupport.isClientTagAllowed('typing')) {
+			return;
+		}
+
+		var active = _controller.text != '';
+		var notify = _setOwnTyping(active);
+		if (notify) {
+			var msg = IrcMessage('TAGMSG', [buffer.name], tags: {'+typing': active ? 'active' : 'done'});
+			client.send(msg);
+		}
+	}
+
+	bool _setOwnTyping(bool active) {
+		bool notify;
+		var time = DateTime.now();
+		if (!active) {
+			notify = _ownTyping != null && _ownTyping!.add(Duration(seconds: 6)).isAfter(time);
+			_ownTyping = null;
+		} else {
+			notify = _ownTyping == null || _ownTyping!.add(Duration(seconds: 3)).isBefore(time);
+			if (notify) {
+				_ownTyping = time;
+			}
+		}
+		return notify;
+	}
+
+	Draft? get draft {
+		if (_controller.text.isEmpty) {
+			return null;
+		}
+		return Draft(text: _controller.text, replyTo: _replyTo?.id);
+	}
+
+	void setReplyTo(MessageModel msg) async {
+		var buffer = context.read<BufferModel>();
+		var client = context.read<Client>();
+
+		var sender = msg.msg.source!.name;
+		var areRepliesAllowed = client.isupport.isClientTagAllowed('draft/reply');
+		if (client.isMyNick(sender) && !areRepliesAllowed) {
+			ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+				content: Text('This server doesn\'t support replies. Replying to yourself won\'t work.'),
+			));
+			return;
+		}
+
+		// TODO: query members when BufferPage is first displayed
+		var nickname = msg.msg.source!.name;
+		if (buffer.members != null && !buffer.members!.members.containsKey(nickname)) {
+			ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+				content: Text('This user is no longer in this channel.'),
+			));
+			return;
+		}
+
+		var prefix = '$nickname: ';
+		if (prefix.startsWith('/')) {
+			// Insert a zero-width space to ensure this doesn't end up
+			// being executed as a command
+			prefix = '\u200B$prefix';
+		}
+
+		_replyTo = msg;
+		if (!_controller.text.startsWith(prefix)) {
+			_controller.text = prefix + _controller.text;
+			_controller.selection = TextSelection.collapsed(offset: _controller.text.length);
+		}
+		_focusNode.requestFocus();
+		setState(() {
+			_isCommand = false;
+		});
+	}
+
+	Future<void> _shareLocation() async {
+		var permission = await Geolocator.checkPermission();
+		if (permission == LocationPermission.denied) {
+			permission = await Geolocator.requestPermission();
+		}
+		if (permission == LocationPermission.denied || permission == LocationPermission.deniedForever) {
+			if (mounted) {
+				ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+					content: Text('Permission to access current location denied'),
+				));
+			}
+			return;
+		}
+
+		Position pos;
+		try {
+			pos = await Geolocator.getCurrentPosition(locationSettings: LocationSettings(
+				timeLimit: Duration(seconds: 15),
+			));
+		} on TimeoutException {
+			if (mounted) {
+				ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+					content: Text('Current location unavailable'),
+				));
+			}
+			return;
+		}
+
+		// TODO: consider including the "u" (uncertainty) parameter, however
+		// some consumers choke on parameters (e.g. Google Maps)
+		var uri = 'geo:${pos.latitude},${pos.longitude}';
+		if (_controller.text == '') {
+			_controller.text = uri;
+		} else {
+			_controller.text += ' ' + uri;
+		}
+	}
+
+	Future<void> _uploadFile(XFile file) async {
+		var client = context.read<Client>();
+		var filehostUrl = Uri.parse(client.isupport.filehost!);
+
+		if (client.params.tls && filehostUrl.scheme != 'https') {
+			throw Exception('File host ($filehostUrl) is not using HTTPS');
+		}
+
+		ContentType? contentType;
+		if (file.mimeType != null) {
+			contentType = ContentType.parse(file.mimeType!);
+		}
+		if (contentType == null) {
+			// file.mimeType is always unset for the io impl of cross_file
+			var mimeType = lookupMimeType(file.name);
+			if (mimeType != null) {
+				contentType = ContentType.parse(mimeType);
+			}
+		}
+
+		// Encode filename according to RFC 5987 if necessary. Note,
+		// encodeQueryComponent will percent-encode a superset of attr-char.
+		Map<String, String?> dispParams = {};
+		var encodedFilename = Uri.encodeQueryComponent(file.name);
+		if (file.name == encodedFilename) {
+			dispParams['filename'] = file.name;
+		} else {
+			dispParams['filename*'] = "UTF-8''" + encodedFilename;
+		}
+		var contentDisposition = HeaderValue('attachment', dispParams);
+
+		var contentLength = await file.length();
+
+		var httpClient = HttpClient();
+		String uploadUrl;
+		try {
+			var saslPlain = client.params.saslPlain;
+			if (saslPlain != null) {
+				httpClient.addCredentials(filehostUrl, '', HttpClientBasicCredentials(saslPlain.username, saslPlain.password));
+			}
+
+			var req = await httpClient.postUrl(filehostUrl);
+			req.headers.contentType = contentType;
+			req.headers.contentLength = contentLength;
+			req.headers.set('Content-Disposition', contentDisposition);
+			await req.addStream(file.openRead());
+			var resp = await req.close();
+			if (resp.statusCode != 201) {
+				throw Exception('HTTP error ${resp.statusCode} (expected 201)');
+			}
+
+			var location = resp.headers.value('Location');
+			if (location == null) {
+				throw FormatException('Missing Location header field in file upload response');
+			}
+			uploadUrl = filehostUrl.resolve(location).toString();
+		} finally {
+			httpClient.close();
+		}
+
+		// TODO: show image preview
+		if (_controller.text != '') {
+			_controller.text += ' ';
+		}
+		_controller.text += uploadUrl;
+	}
+
+	Future<void> _startRecord() async {
+		var record = AudioRecorder();
+		if (!await record.hasPermission()) {
+			return;
+		}
+		var dir = await getTemporaryDirectory();
+		await record.start(RecordConfig(encoder: AudioEncoder.aacLc, numChannels: 1, autoGain: true, noiseSuppress: true), path: '${dir.path}/audio-record.m4a');
+		setState(() {
+			_recorder = record;
+			_recordTimer = Stream.periodic(Duration(seconds: 1), (n) => '${((n+1)/60).floor()}:${(n+1).remainder(60).toString().padLeft(2, '0')}');
+		});
+	}
+
+	Future<void> _runAddMenuTask(Future<void> Function() f) async {
+		setState(() {
+			_addMenuLoading = true;
+		});
+		try {
+			await f();
+		} on Exception catch (err) {
+			if (mounted) {
+				ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+					content: Text(err.toString()),
+				));
+			}
+		} finally {
+			if (mounted) {
+				setState(() {
+					_addMenuLoading = false;
+				});
+			}
+		}
+	}
+
+	Future<void> _cancelRecord() async {
+		var file = await _recorder?.stop();
+		await _recorder?.dispose();
+		if (file != null) {
+			await File(file).delete();
+		}
+	}
+
+	@override
+	void dispose() {
+		_focusNode.dispose();
+		_controller.dispose();
+		unawaited(_cancelRecord());
+		super.dispose();
+	}
+
+	Widget _buildTextField(BuildContext context, TextEditingController controller, FocusNode focusNode, VoidCallback onFieldSubmitted) {
+		var client = context.read<Client>();
+		var prefs = context.read<Prefs>();
+		var sendTyping = prefs.typingIndicator;
+
+		ContentInsertionConfiguration? contentInsertionConfiguration;
+		if (client.isupport.filehost != null) {
+			contentInsertionConfiguration = ContentInsertionConfiguration(
+				onContentInserted: (data) async {
+					if (!data.hasData) {
+						return;
+					}
+					var file = XFile.fromData(data.data!, mimeType: data.mimeType, path: data.uri);
+					await _runAddMenuTask(() async {
+						await _uploadFile(file);
+					});
+				},
+			);
+		}
+
+		return TextFormField(
+			controller: controller,
+			focusNode: focusNode,
+			onChanged: (value) {
+				if (sendTyping) {
+					_sendTypingStatus();
+				}
+
+				var replyPrefix = _getReplyPrefix();
+				if (replyPrefix != null && !value.startsWith(replyPrefix)) {
+					_replyTo = null;
+				}
+
+				setState(() {
+					_isCommand = value.startsWith('/') && !value.contains('\n');
+				});
+			},
+			onFieldSubmitted: (value) {
+				onFieldSubmitted();
+				_submit();
+			},
+			// Prevent the virtual keyboard from being closed when
+			// sending a message
+			onEditingComplete: () {},
+			decoration: InputDecoration(
+				hintText: 'Write a message...',
+				border: InputBorder.none,
+			),
+			textInputAction: TextInputAction.send,
+			minLines: 1,
+			maxLines: 5,
+			keyboardType: TextInputType.text, // disallows newlines
+			contentInsertionConfiguration: contentInsertionConfiguration,
+		);
+	}
+
+	Widget _buildOptionsView(BuildContext context, AutocompleteOnSelected<_AutocompleteOption> onSelected, Iterable<_AutocompleteOption> options) {
+		var listView = ListView.builder(
+			padding: EdgeInsets.zero,
+			shrinkWrap: true,
+			itemCount: options.length,
+			reverse: true,
+			itemBuilder: (context, index) {
+				var option = options.elementAt(index);
+				return InkWell(
+					onTap: () {
+						onSelected(option);
+					},
+					child: Builder(
+						builder: (context) {
+							var highlight = AutocompleteHighlightedOption.of(context) == index;
+							if (highlight) {
+								SchedulerBinding.instance.addPostFrameCallback((timeStamp) {
+									Scrollable.ensureVisible(context, alignment: 0.5);
+								});
+							}
+							return Container(
+								color: highlight ? Theme.of(context).focusColor : null,
+								padding: const EdgeInsets.all(16.0),
+								child: Text.rich(TextSpan(children: [
+									TextSpan(text: option.value),
+									if (option.description != null) TextSpan(
+										text: '  ' + option.description!,
+										style: TextStyle(color: Theme.of(context).colorScheme.secondary)
+									),
+								]), overflow: TextOverflow.ellipsis),
+							);
+						},
+					),
+				);
+			},
+		);
+
+		return Material(elevation: 4.0, child: listView);
+	}
+
+	@override
+	Widget build(BuildContext context) {
+		var client = context.read<Client>();
+		var buffer = context.watch<BufferModel>();
+		var network = context.watch<NetworkModel>();
+
+		var canSendMessage = canSendMessageToBuffer(buffer, network);
+		var canUploadFiles = client.isupport.filehost != null && canSendMessage;
+
+		if (_recorder != null) {
+			return SafeArea(child: Row(children: [
+				Container(
+					width: 15,
+					height: 15,
+					margin: EdgeInsets.all(10),
+					child: CircularProgressIndicator(strokeWidth: 2),
+				),
+				Expanded(child: Text('Recording audio...')),
+				StreamBuilder(stream: _recordTimer!, initialData: '0:00', builder: (BuildContext context, AsyncSnapshot<String> snapshot) => Text(snapshot.data ?? '')),
+				IconButton(
+					icon: Icon(Icons.delete),
+					onPressed: () async {
+						await _cancelRecord();
+						setState(() {
+							_recorder = null;
+							_recordTimer = null;
+						});
+					},
+					tooltip: 'Cancel',
+					color: Colors.red,
+				),
+				FloatingActionButton(
+					onPressed: () async {
+						var file = await _recorder?.stop();
+						await _recorder?.dispose();
+						setState(() {
+							_recorder = null;
+							_recordTimer = null;
+						});
+						if (file == null) {
+							return;
+						}
+						await _runAddMenuTask(() async {
+							try {
+								await _uploadFile(XFile(file, mimeType: 'audio/mp4'));
+							} finally {
+								await File(file).delete();
+							}
+						});
+					},
+					tooltip: 'Accept',
+					mini: true,
+					elevation: 0,
+					child: Icon(Icons.check, size: 18),
+				),
+			]));
+		}
+
+		var fab = FloatingActionButton(
+			onPressed: _submit,
+			tooltip: _isCommand ? 'Execute' : 'Send',
+			backgroundColor: _isCommand ? Colors.red : null,
+			mini: true,
+			elevation: 0,
+			child: Icon(_isCommand ? Icons.done : Icons.send, size: 18),
+		);
+
+		Widget? addMenu;
+		if (_addMenuLoading) {
+			addMenu = Container(
+				width: 15,
+				height: 15,
+				margin: EdgeInsets.all(10),
+				child: CircularProgressIndicator(strokeWidth: 2),
+			);
+		} else if (_locationServiceAvailable || canUploadFiles) {
+			addMenu = IconButton(
+				icon: const Icon(Icons.add),
+				tooltip: 'Add',
+				onPressed: () {
+					showModalBottomSheet<void>(
+						context: context,
+						builder: (context) => SafeArea(child: Column(mainAxisSize: MainAxisSize.min, children: [
+							if (_locationServiceAvailable) ListTile(
+								title: Text('Share my location'),
+								leading: Icon(Icons.my_location),
+								onTap: () {
+									Navigator.pop(context);
+									_runAddMenuTask(_shareLocation);
+								}
+							),
+							if (canUploadFiles) ListTile(
+								title: Text('Share from gallery'),
+								leading: Icon(Icons.add_photo_alternate),
+								onTap: () async {
+									Navigator.pop(context);
+									var file = await _imagePicker.pickMedia();
+									if (file != null) {
+										await _runAddMenuTask(() async {
+											await _uploadFile(file);
+										});
+									}
+								},
+							),
+							if (canUploadFiles) ListTile(
+								title: Text('Share a file'),
+								leading: Icon(Icons.upload_file),
+								onTap: () async {
+									Navigator.pop(context);
+									var file = await openFile(confirmButtonText: 'Upload');
+									if (file != null) {
+										await _runAddMenuTask(() async {
+											await _uploadFile(file);
+										});
+									}
+								},
+							),
+							if (canUploadFiles && _imagePicker.supportsImageSource(ImageSource.camera)) ListTile(
+								title: Text('Take a picture'),
+								leading: Icon(Icons.photo_camera),
+								onTap: () async {
+									Navigator.pop(context);
+									var file = await _imagePicker.pickImage(source: ImageSource.camera);
+									if (file != null) {
+										await _runAddMenuTask(() async {
+											await _uploadFile(file);
+										});
+									}
+								},
+							),
+							if (canUploadFiles) ListTile(
+								title: Text('Record audio'),
+								leading: Icon(Icons.mic),
+								onTap: () async {
+									Navigator.pop(context);
+									await _startRecord();
+								},
+							),
+						])),
+					);
+				},
+			);
+		}
+
+		return SafeArea(child: Form(key: _formKey, child: Row(children: [
+			Expanded(child: RawAutocomplete(
+				optionsBuilder: _buildOptions,
+				displayStringForOption: _displayStringForOption,
+				fieldViewBuilder: _buildTextField,
+				focusNode: _focusNode,
+				textEditingController: _controller,
+				optionsViewBuilder: _buildOptionsView,
+				optionsViewOpenDirection: OptionsViewOpenDirection.up,
+			)),
+			if (addMenu != null) addMenu,
+			fab,
+		])));
+	}
+}
+
+class _AutocompleteOption {
+	final String value;
+	final String? description;
+
+	const _AutocompleteOption(this.value, [this.description]);
+}
+
+class _CommandTextEditingController extends TextEditingController {
+	@override
+	TextSpan buildTextSpan({
+		required BuildContext context,
+		TextStyle? style,
+		required bool withComposing,
+	}) {
+		var textSpan = super.buildTextSpan(context: context, style: style, withComposing: withComposing);
+		if (!text.startsWith('/')) {
+			return textSpan;
+		}
+
+		var cmd = commands[text.toLowerCase().substring(1).trim()];
+		if (cmd == null) {
+			return textSpan;
+		}
+
+		var suggestion = cmd.usage;
+		if (!text.endsWith(' ')) {
+			suggestion = ' ' + cmd.usage;
+		}
+
+		var suggestColor = (style ?? DefaultTextStyle.of(context).style).color!.withValues(alpha: 0.5);
+		return TextSpan(style: style, children: [
+			textSpan,
+			TextSpan(text: suggestion, style: TextStyle(color: suggestColor)),
+		]);
+	}
+}
