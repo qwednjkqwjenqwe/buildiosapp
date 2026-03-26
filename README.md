@@ -1,3 +1,5 @@
+![grendel](https://f.9larp.net/grendel.png)
+
 # [goguma]
 
 An IRC client for mobile devices.
