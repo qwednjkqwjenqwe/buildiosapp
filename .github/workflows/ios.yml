@@ -5,6 +5,10 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-ios:
     runs-on: macos-13
@@ -25,13 +29,11 @@ jobs:
           flutter build ios --release --no-codesign \
             -- \
             IPHONEOS_DEPLOYMENT_TARGET=11.0
-
       - name: Package IPA
         run: |
           mkdir Payload
           cp -r build/ios/iphoneos/Runner.app Payload/
           zip -r app.ipa Payload
-
       - uses: actions/upload-artifact@v4
         with:
           name: ios-app-ios11
