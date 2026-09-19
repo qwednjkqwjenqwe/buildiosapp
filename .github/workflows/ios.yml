@@ -7,10 +7,13 @@ on:
 
 jobs:
   build-ios:
-    runs-on: macos-latest
+    runs-on: macos-13
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_14.2.app/Contents/Developer
 
       - uses: subosito/flutter-action@v2
         with:
@@ -18,7 +21,10 @@ jobs:
 
       - run: flutter pub get
 
-      - run: flutter build ios --release --no-codesign
+      - run: |
+          flutter build ios --release --no-codesign \
+            -- \
+            IPHONEOS_DEPLOYMENT_TARGET=11.0
 
       - name: Package IPA
         run: |
@@ -28,5 +34,5 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ios-app
+          name: ios-app-ios11
           path: app.ipa
